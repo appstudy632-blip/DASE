@@ -1,20 +1,13 @@
 # app.py
-# Streamlit app for:
-#   DA   (Decentralized with infinite storage, per-agent LP)
-#   SE   (Sequential Equalizing – progressive filling)
-#   DASE (DA + SE on residual supply)
-#
-# Assumes infinite storage.
-# No built-in examples. User must input data.
+# Streamlit app for Fair Division with Storage (Infinite or Finite)
 
 from __future__ import annotations
 
-import io
 import numpy as np
 import pandas as pd
 import streamlit as st
 import pulp
-import math  
+import math
 
 
 # ============================
@@ -39,33 +32,48 @@ def parse_vector(text: str) -> np.ndarray:
     raise ValueError("Supply must be a single row or column.")
 
 
-def validate(d: np.ndarray, S: np.ndarray):
+def parse_capacity(text: str) -> float | None:
+    """Parse capacity input. Returns None for infinite, float for finite."""
+    text = text.strip().upper()
+    if text in ["INF", "INFINITE", "∞", ""]:
+        return None
+    try:
+        C = float(text)
+        if C < 0:
+            raise ValueError("Capacity must be non-negative.")
+        return C
+    except ValueError:
+        raise ValueError(
+            f"Invalid capacity: '{text}'. Use a non-negative number or 'INF'."
+        )
+
+
+def validate(d: np.ndarray, S: np.ndarray, C: float = None):
     if d.ndim != 2:
         raise ValueError("Demands must be a matrix.")
     if S.ndim != 1:
         raise ValueError("Supply must be a vector.")
     if d.shape[1] != len(S):
         raise ValueError("Supply length must equal number of time steps.")
-
     if np.any(d < 0) or np.any(S < 0):
         raise ValueError("All values must be non-negative.")
 
     row_sums = d.sum(axis=1)
     if np.any(row_sums <= 0):
         raise ValueError("Each agent must have positive total demand.")
-
     if not np.allclose(row_sums, row_sums[0]):
         raise ValueError("All demand rows must sum to the same total.")
+    if C is not None and C < 0:
+        raise ValueError("Capacity must be non-negative.")
 
 
 # ============================
-# DA (per-agent LP, infinite storage)
+# DA / DA-Finite
 # ============================
 
-def da_single_agent(d_i: np.ndarray, S: np.ndarray, n: int):
+def da_single_agent(d_i: np.ndarray, S: np.ndarray, n: int, C: float = None):
     """
-    Agent receives S(t)/n each time.
-    Chooses allocation w(t) and carry y(t) to maximize beta.
+    Agent i maximizes utility from S_i = S/n with optional capacity C_i = C/n.
     """
     T = len(S)
     Si = S / n
@@ -78,10 +86,18 @@ def da_single_agent(d_i: np.ndarray, S: np.ndarray, n: int):
 
     prob += beta
 
+    # Feasibility constraints
     prob += w[0] + y[0] <= Si[0]
     for t in range(1, T):
         prob += w[t] + y[t] <= Si[t] + y[t - 1]
 
+    # Capacity constraints (finite storage only)
+    if C is not None:
+        C_i = C / n
+        for t in range(T):
+            prob += y[t] <= C_i
+
+    # Tightness constraints
     for t in range(T):
         if d_i[t] > 0:
             prob += beta * d_i[t] <= w[t]
@@ -96,61 +112,53 @@ def da_single_agent(d_i: np.ndarray, S: np.ndarray, n: int):
     return w_val, beta_val
 
 
-def DA(demands: np.ndarray, S: np.ndarray):
+def DA(demands: np.ndarray, S: np.ndarray, C: float = None):
+    """DA or DA-Finite depending on C."""
     n, T = demands.shape
     alloc = np.zeros((n, T))
     beta = np.zeros(n)
 
     for i in range(n):
-        alloc[i], beta[i] = da_single_agent(demands[i], S, n)
+        alloc[i], beta[i] = da_single_agent(demands[i], S, n, C)
 
     return alloc, beta
 
 
 # ============================
-# SE (progressive filling, EXACT)
+# SE / SE-Finite
 # ============================
-
 
 def SE(demands: np.ndarray, S_step: np.ndarray) -> np.ndarray:
     """
-    SE / progressive filling with forward-only storage.
-    Accepts per-step S_step that may contain negatives, as long as all prefixes
-    cumS(t)=sum_{<=t} S_step are nonnegative.
-
-    This implements the 'frontier p' version:
-      - pick bottleneck t* using segment slack from p..t
-      - allocate Delta * demands on t>=p
-      - advance p = t*+1
-      - finalize agents with any demand in the saturated prefix
+    Sequential Equalizing (works for both infinite and finite storage).
+    For finite storage, capacity is implicitly satisfied.
     """
     n, T = demands.shape
     w = np.zeros((n, T), dtype=float)
 
     cumS = np.cumsum(S_step).astype(float)
     if cumS.min() < -1e-9:
-        raise ValueError("Prefix-infeasible supply for forward-only storage (negative prefix).")
+        raise ValueError("Prefix-infeasible supply.")
 
     active = set(range(n))
-    p = 0  # first unsaturated time index
+    p = 0  # frontier
 
     while active and p < T:
         cumAlloc = np.cumsum(w.sum(axis=0))
-        slack = cumS - cumAlloc  # remaining prefix slack for [0..t]
+        slack = cumS - cumAlloc
 
-        base = 0.0 if p == 0 else slack[p-1]  # slack already 'committed' up to p-1
+        base = 0.0 if p == 0 else slack[p - 1]
 
         best_t = None
         best_ratio = math.inf
 
         for t in range(p, T):
-            denom = sum(demands[i, p:t+1].sum() for i in active)
+            denom = sum(demands[i, p : t + 1].sum() for i in active)
             if denom <= 0:
                 continue
 
-            seg_slack = slack[t] - base  # slack available for the segment [p..t]
+            seg_slack = slack[t] - base
             if seg_slack < -1e-12:
-                # segment already infeasible; skip (shouldn't happen if code is consistent)
                 continue
 
             ratio = seg_slack / denom
@@ -163,48 +171,33 @@ def SE(demands: np.ndarray, S_step: np.ndarray) -> np.ndarray:
 
         Delta = best_ratio
 
-        # allocate only on the unsaturated suffix
         for i in active:
             w[i, p:] += Delta * demands[i, p:]
 
-        # segment [p..best_t] becomes tight; move frontier
         p = best_t + 1
-
-        # finalize agents with any demand in the saturated prefix
         active = {i for i in active if not np.any(demands[i, :p] > 0)}
 
     return w
 
 
 # ============================
-# DASE / SEIR
+# DASE / DASE-Finite
 # ============================
 
-
 def residual_prefix_budget(S: np.ndarray, w_DA: np.ndarray) -> np.ndarray:
-    """
-    Returns residual prefix budget Shat_rem(t) after DA:
-        Shat_rem(t) = sum_{<=t} S - sum_{<=t} sum_i w_DA
-    Must be >=0 for all t under forward-only storage.
-    """
+    """Cumulative residual supply after DA."""
     S = S.astype(float)
     A = w_DA.sum(axis=0).astype(float)
     Shat_rem = np.cumsum(S) - np.cumsum(A)
 
     if Shat_rem.min() < -1e-9:
         t_bad = int(np.argmin(Shat_rem))
-        raise ValueError(
-            f"DA allocation is prefix-infeasible (borrows from the future) at t={t_bad}: "
-            f"residual_prefix={Shat_rem[t_bad]:.6g}."
-        )
+        raise ValueError(f"DA allocation is prefix-infeasible at t={t_bad}.")
     return Shat_rem
 
 
 def prefix_budget_to_step_supply(Shat: np.ndarray) -> np.ndarray:
-    """
-    Convert a prefix budget Shat(t) into a per-step vector S_step with the same prefixes.
-    This S_step may have negative entries; that is OK (prefixes remain nonnegative).
-    """
+    """Convert cumulative to per-step supply."""
     Shat = Shat.astype(float)
     S_step = np.empty_like(Shat)
     S_step[0] = Shat[0]
@@ -213,92 +206,143 @@ def prefix_budget_to_step_supply(Shat: np.ndarray) -> np.ndarray:
 
 
 def DASE(demands: np.ndarray, S: np.ndarray, w_DA: np.ndarray) -> np.ndarray:
-    """
-    DASE = w_DA + SE(d, S_rem), where S_rem represents the residual prefix budget after DA.
-    IMPORTANT: SE sees the ORIGINAL demands (not residual demands).
-    """
+    """DASE / DASE-Finite = DA + SE on residual."""
     Shat_rem = residual_prefix_budget(S, w_DA)
     S_rem = prefix_budget_to_step_supply(Shat_rem)
     w_SE = SE(demands, S_rem)
     return w_DA + w_SE
 
 
-
 def alpha_from_alloc(w: np.ndarray, d: np.ndarray) -> float:
-    """
-    Leontief-style alpha: min_{t: d(t)>0} w(t)/d(t).
-    If an agent has no positive demands (shouldn't happen in your validation), return +inf.
-    """
+    """Leontief utility."""
     mask = d > 0
     if not np.any(mask):
         return float("inf")
     return float(np.min(w[mask] / d[mask]))
 
 
-
 # ============================
 # Streamlit UI
 # ============================
 
-st.set_page_config(page_title="DA / SE / DASE", layout="wide")
-st.title("DA / SE / DASE — Infinite Storage")
+st.set_page_config(page_title="Fair Division with Storage", layout="wide")
+st.title("Fair Division Over Time with Storage")
 
 st.markdown("""
-Insert your instance below.
+### About
 
-• Demands: rows = agents, columns = time steps  
-• Supply: one row or column  
-• All demand rows must sum to the same value  
+This tool implements fair division mechanisms for allocating a divisible resource over time with storage:
+
+- **DA / DA-Finite:** Each agent independently optimizes from an equal 1/n share
+- **SE / SE-Finite:** Sequential equalizing distributes supply proportionally
+- **DASE / DASE-Finite:** Combines DA + SE for Pareto efficiency
+
+**Storage Capacity:**
+- **Infinite (C = INF):** No storage limit
+- **Finite (C = number):** Total capacity C, each agent gets C/n
+
+---
 """)
 
-dem_text = st.text_area(
-    "Demands",
-    placeholder="e.g.\n1 2 1 0\n3 1 0 0\n0 2 2 0",
-    height=180,
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    dem_text = st.text_area(
+        "**Demands** (rows = agents, columns = time steps)",
+        placeholder="Example:\n1 2 1 0 0\n3 1 0 0 0\n0 2 1 0 1",
+        height=140,
+    )
+
+with col2:
+    sup_text = st.text_area(
+        "**Supply** (per time step)",
+        placeholder="Example:\n36 36 36 42 50",
+        height=140,
+    )
+
+capacity_text = st.text_input(
+    "**Storage Capacity C**",
+    value="INF",
+    help="Enter 'INF' for infinite storage, or a number for finite capacity.",
 )
 
-sup_text = st.text_area(
-    "Supply",
-    placeholder="e.g.\n36 36 36 42",
-    height=80,
-)
+st.info("ℹ️ All demand rows must sum to the same value.")
 
-if st.button("Compute allocations", type="primary"):
+if st.button("⚡ Compute Allocations", type="primary", use_container_width=True):
     try:
+        # Parse
         demands = parse_matrix(dem_text)
         supply = parse_vector(sup_text)
-        validate(demands, supply)
+        C = parse_capacity(capacity_text)
+        validate(demands, supply, C)
 
-        w_DA, beta_DA = DA(demands, supply)
+        # Compute
+        w_DA, beta_DA = DA(demands, supply, C)
         w_SE = SE(demands, supply)
         w_DASE = DASE(demands, supply, w_DA)
 
+        # Utilities
         alpha_DA = [alpha_from_alloc(w_DA[i], demands[i]) for i in range(len(demands))]
         alpha_SE = [alpha_from_alloc(w_SE[i], demands[i]) for i in range(len(demands))]
-        alpha_DASE = [alpha_from_alloc(w_DASE[i], demands[i]) for i in range(len(demands))]
+        alpha_DASE = [
+            alpha_from_alloc(w_DASE[i], demands[i]) for i in range(len(demands))
+        ]
 
-        idx = [f"agent_{i}" for i in range(len(demands))]
-        cols = [f"t{t}" for t in range(demands.shape[1])]
+        # Format
+        n_agents, n_times = demands.shape
+        idx = [f"Agent {i+1}" for i in range(n_agents)]
+        cols = [f"t={t+1}" for t in range(n_times)]
 
-        tab1, tab2, tab3 = st.tabs(["SE", "DA", "DASE"])
+        mode_label = "Infinite Storage" if C is None else f"Finite Storage (C = {C})"
+        suffix = "" if C is None else "-Finite"
+
+        st.success(f"✓ **{mode_label}**")
+
+        tab1, tab2, tab3 = st.tabs([f"DA{suffix}", f"SE{suffix}", f"DASE{suffix}"])
 
         with tab1:
-            st.dataframe(pd.DataFrame(w_SE, index=idx, columns=cols))
-            st.write("Alphas:", alpha_SE)
+            st.markdown(f"### DA{suffix} Allocation")
+            st.dataframe(
+                pd.DataFrame(w_DA, index=idx, columns=cols).style.format("{:.3f}"),
+                use_container_width=True,
+            )
+            st.dataframe(
+                pd.DataFrame({"Agent": idx, "Utility (α)": alpha_DA}),
+                use_container_width=True,
+                hide_index=True,
+            )
 
         with tab2:
-            st.dataframe(pd.DataFrame(w_DA, index=idx, columns=cols))
-            st.write("Alphas:", alpha_DA)
+            st.markdown(f"### SE{suffix} Allocation")
+            st.dataframe(
+                pd.DataFrame(w_SE, index=idx, columns=cols).style.format("{:.3f}"),
+                use_container_width=True,
+            )
+            st.dataframe(
+                pd.DataFrame({"Agent": idx, "Utility (α)": alpha_SE}),
+                use_container_width=True,
+                hide_index=True,
+            )
 
         with tab3:
-            st.dataframe(pd.DataFrame(w_DASE, index=idx, columns=cols))
-            st.write("Alphas:", alpha_DASE)
+            st.markdown(f"### DASE{suffix} Allocation")
+            st.dataframe(
+                pd.DataFrame(w_DASE, index=idx, columns=cols).style.format("{:.3f}"),
+                use_container_width=True,
+            )
+            st.dataframe(
+                pd.DataFrame({"Agent": idx, "Utility (α)": alpha_DASE}),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            with st.expander("🔍 Show residual supply after DA"):
+                Shat_rem = residual_prefix_budget(supply, w_DA)
+                S_rem = prefix_budget_to_step_supply(Shat_rem)
+                st.write("**Cumulative residual Ŝ_rem:**", Shat_rem)
+                st.write("**Per-step residual S':**", S_rem)
 
     except Exception as e:
-        st.error(str(e))
+        st.error(f"❌ {str(e)}")
 
-
-
-
-
-
+st.caption("CATS model for fair division over time with storage")
