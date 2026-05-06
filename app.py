@@ -131,7 +131,7 @@ def DA(demands: np.ndarray, S: np.ndarray, C: float = None):
 def SE(demands: np.ndarray, S_step: np.ndarray) -> np.ndarray:
     """
     Sequential Equalizing (works for both infinite and finite storage).
-    For finite storage, capacity is implicitly satisfied.
+    For finite storage in DASE, capacity is implicitly satisfied.
     """
     n, T = demands.shape
     w = np.zeros((n, T), dtype=float)
@@ -181,6 +181,81 @@ def SE(demands: np.ndarray, S_step: np.ndarray) -> np.ndarray:
 
 
 # ============================
+# SE-Capacity (Standalone with explicit capacity enforcement)
+# ============================
+
+def SE_Capacity(demands: np.ndarray, S: np.ndarray, C: float) -> tuple[np.ndarray | None, str | None]:
+    """
+    SE-Capacity with explicit capacity constraints.
+    Returns (allocation, None) if feasible, or (None, error_msg) if infeasible.
+    """
+    n, T = demands.shape
+    w = np.zeros((n, T), dtype=float)
+    
+    cumS = np.cumsum(S).astype(float)
+    active = set(range(n))
+    finalized = set()
+    
+    iteration = 0
+    max_iterations = n * T  # Safety limit
+    
+    while active and iteration < max_iterations:
+        iteration += 1
+        
+        # Compute cumulative allocations and demands
+        cumW = np.cumsum(w.sum(axis=0))
+        cumD_active = np.zeros(T)
+        
+        for t in range(T):
+            for i in active:
+                cumD_active[t] += demands[i, :t+1].sum()
+        
+        # Compute bounds
+        delta_max = float('inf')
+        delta_min = float('-inf')
+        t_max = -1
+        
+        for t in range(T):
+            if cumD_active[t] <= 1e-12:
+                continue
+            
+            # Upper bound from supply
+            upper = (cumS[t] - cumW[t]) / cumD_active[t]
+            if upper < delta_max:
+                delta_max = upper
+                t_max = t
+            
+            # Lower bound from capacity
+            lower = (cumS[t] - C - cumW[t]) / cumD_active[t]
+            if lower > delta_min:
+                delta_min = lower
+        
+        # Check feasibility
+        if delta_min > delta_max + 1e-9:
+            return None, f"Infeasible: Δ_min = {delta_min:.4f} > Δ_max = {delta_max:.4f}"
+        
+        if delta_max < 1e-12 or t_max == -1:
+            break
+        
+        # Allocate with Delta = delta_max
+        Delta = delta_max
+        
+        for i in active:
+            w[i, :] += Delta * demands[i, :]
+        
+        # Finalize agents with demand up to t_max
+        newly_finalized = set()
+        for i in active:
+            if np.any(demands[i, :t_max+1] > 1e-12):
+                newly_finalized.add(i)
+        
+        finalized.update(newly_finalized)
+        active -= newly_finalized
+    
+    return w, None
+
+
+# ============================
 # DASE / DASE-Finite
 # ============================
 
@@ -206,7 +281,7 @@ def prefix_budget_to_step_supply(Shat: np.ndarray) -> np.ndarray:
 
 
 def DASE(demands: np.ndarray, S: np.ndarray, w_DA: np.ndarray) -> np.ndarray:
-    """DASE / DASE-Finite = DA + SE on residual."""
+    """DASE / DASE-Finite = DA + SE on residual (always uses original SE)."""
     Shat_rem = residual_prefix_budget(S, w_DA)
     S_rem = prefix_budget_to_step_supply(Shat_rem)
     w_SE = SE(demands, S_rem)
@@ -234,8 +309,9 @@ st.markdown("""
 This tool implements fair division mechanisms for allocating a divisible resource over time with storage:
 
 - **DA / DA-Finite:** Each agent independently optimizes from an equal 1/n share
-- **SE / SE-Finite:** Sequential equalizing distributes supply proportionally
-- **DASE / DASE-Finite:** Combines DA + SE for Pareto efficiency
+- **SE:** Sequential equalizing (infinite storage only)
+- **SE-Capacity:** SE with explicit capacity enforcement (may return infeasible)
+- **DASE / DASE-Finite:** Combines DA + SE for Pareto efficiency (uses original SE, capacity implicit)
 
 **Storage Capacity:**
 - **Infinite (C = INF):** No storage limit
@@ -278,15 +354,7 @@ if st.button("⚡ Compute Allocations", type="primary", use_container_width=True
 
         # Compute
         w_DA, beta_DA = DA(demands, supply, C)
-        w_SE = SE(demands, supply)
         w_DASE = DASE(demands, supply, w_DA)
-
-        # Utilities
-        alpha_DA = [alpha_from_alloc(w_DA[i], demands[i]) for i in range(len(demands))]
-        alpha_SE = [alpha_from_alloc(w_SE[i], demands[i]) for i in range(len(demands))]
-        alpha_DASE = [
-            alpha_from_alloc(w_DASE[i], demands[i]) for i in range(len(demands))
-        ]
 
         # Format
         n_agents, n_times = demands.shape
@@ -298,8 +366,50 @@ if st.button("⚡ Compute Allocations", type="primary", use_container_width=True
 
         st.success(f"✓ **{mode_label}**")
 
-        tab1, tab2, tab3 = st.tabs([f"DA{suffix}", f"SE{suffix}", f"DASE{suffix}"])
+        # Create tabs based on storage type
+        if C is None:
+            # Infinite storage: DA, SE, DASE
+            w_SE = SE(demands, supply)
+            alpha_SE = [alpha_from_alloc(w_SE[i], demands[i]) for i in range(len(demands))]
+            
+            tab1, tab2, tab3 = st.tabs(["DA", "SE", "DASE"])
+            
+            with tab2:
+                st.markdown("### SE Allocation")
+                st.dataframe(
+                    pd.DataFrame(w_SE, index=idx, columns=cols).style.format("{:.3f}"),
+                    use_container_width=True,
+                )
+                st.dataframe(
+                    pd.DataFrame({"Agent": idx, "Utility (α)": alpha_SE}),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        else:
+            # Finite storage: DA-Finite, SE-Capacity, DASE-Finite
+            w_SE_cap, error_msg = SE_Capacity(demands, supply, C)
+            
+            tab1, tab2, tab3 = st.tabs(["DA-Finite", "SE-Capacity", "DASE-Finite"])
+            
+            with tab2:
+                st.markdown("### SE-Capacity Allocation")
+                if error_msg:
+                    st.error(f"❌ **{error_msg}**")
+                    st.info("💡 SE-Capacity may return infeasible even when feasible allocations exist. Use DASE-Finite for guaranteed feasibility.")
+                else:
+                    alpha_SE_cap = [alpha_from_alloc(w_SE_cap[i], demands[i]) for i in range(len(demands))]
+                    st.dataframe(
+                        pd.DataFrame(w_SE_cap, index=idx, columns=cols).style.format("{:.3f}"),
+                        use_container_width=True,
+                    )
+                    st.dataframe(
+                        pd.DataFrame({"Agent": idx, "Utility (α)": alpha_SE_cap}),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
+        # DA tab (common for both)
+        alpha_DA = [alpha_from_alloc(w_DA[i], demands[i]) for i in range(len(demands))]
         with tab1:
             st.markdown(f"### DA{suffix} Allocation")
             st.dataframe(
@@ -312,18 +422,8 @@ if st.button("⚡ Compute Allocations", type="primary", use_container_width=True
                 hide_index=True,
             )
 
-        with tab2:
-            st.markdown(f"### SE{suffix} Allocation")
-            st.dataframe(
-                pd.DataFrame(w_SE, index=idx, columns=cols).style.format("{:.3f}"),
-                use_container_width=True,
-            )
-            st.dataframe(
-                pd.DataFrame({"Agent": idx, "Utility (α)": alpha_SE}),
-                use_container_width=True,
-                hide_index=True,
-            )
-
+        # DASE tab (common for both)
+        alpha_DASE = [alpha_from_alloc(w_DASE[i], demands[i]) for i in range(len(demands))]
         with tab3:
             st.markdown(f"### DASE{suffix} Allocation")
             st.dataframe(
@@ -341,6 +441,9 @@ if st.button("⚡ Compute Allocations", type="primary", use_container_width=True
                 S_rem = prefix_budget_to_step_supply(Shat_rem)
                 st.write("**Cumulative residual Ŝ_rem:**", Shat_rem)
                 st.write("**Per-step residual S':**", S_rem)
+            
+            if C is not None:
+                st.info("ℹ️ DASE-Finite uses original SE (not SE-Capacity) on residual supply. Capacity is automatically satisfied (implicit).")
 
     except Exception as e:
         st.error(f"❌ {str(e)}")
